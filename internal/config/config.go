@@ -226,6 +226,8 @@ type GlobalConfig struct {
 	// ProviderPlugins are operator-installed PR/CI provider executables keyed
 	// by plugin name. Global-only: see ProviderPlugin.
 	ProviderPlugins ProviderPlugins `yaml:"-"`
+	// GitHubCIReader is global-only: see GitHubCIReader.
+	GitHubCIReader *GitHubCIReader `yaml:"-"`
 	// RepositoryOverrides scopes machine-local settings to canonicalized
 	// remote host/owner/repository identities.
 	RepositoryOverrides RepositoryOverrides `yaml:"repository_overrides"`
@@ -302,6 +304,7 @@ type globalConfigRaw struct {
 	Jev                 retiredJev                   `yaml:"jev"`
 	ForgeProfiles       ForgeProfiles                `yaml:"forge_profiles"`
 	ProviderPlugins     map[string]providerPluginRaw `yaml:"provider_plugins"`
+	GitHubCIReader      *GitHubCIReader              `yaml:"github_ci_reader"`
 	RepositoryOverrides RepositoryOverrides          `yaml:"repository_overrides"`
 	Providers           ProvidersRaw                 `yaml:"providers"`
 }
@@ -826,6 +829,8 @@ type Config struct {
 	// ProviderPlugins is copied from global config only (see ProviderPlugin);
 	// no repository layer can add or change an entry.
 	ProviderPlugins ProviderPlugins
+	// GitHubCIReader is copied from global config only (see GitHubCIReader).
+	GitHubCIReader *GitHubCIReader
 	// DisableProjectSettings is the resolved, trusted-only opt-out (see the
 	// RepoConfig field). When true, gate agents are launched with their
 	// project-level settings/instructions suppressed; the daemon fails the run
@@ -2603,6 +2608,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		return nil, err
 	}
 	cfg.ProviderPlugins = plugins
+	if cfg.GitHubCIReader, err = normalizeGitHubCIReader(raw.GitHubCIReader); err != nil {
+		return nil, err
+	}
 	if raw.RepositoryOverrides != nil {
 		overrides, err := normalizeRepositoryOverrides(raw.RepositoryOverrides)
 		if err != nil {
@@ -3662,6 +3670,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		PR:              pr,
 		ForgeProfiles:   global.ForgeProfiles,
 		ProviderPlugins: global.ProviderPlugins,
+		GitHubCIReader:  global.GitHubCIReader,
 		Providers:       providers,
 		// repo is the EffectiveRepoConfig result, so this value is already
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).

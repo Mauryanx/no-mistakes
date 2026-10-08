@@ -23,8 +23,8 @@ func TestIsFakeProviderPlugin(t *testing.T) {
 		{argv0: "git", want: false},
 		{argv0: "git.EXE", want: false},
 	} {
-		if got := isFakeProviderPlugin(tc.argv0); got != tc.want {
-			t.Errorf("isFakeProviderPlugin(%q) = %v, want %v", tc.argv0, got, tc.want)
+		if got := isFakeExecutable(tc.argv0, fakeplugin.ExecutableName); got != tc.want {
+			t.Errorf("isFakeExecutable(%q) = %v, want %v", tc.argv0, got, tc.want)
 		}
 	}
 }

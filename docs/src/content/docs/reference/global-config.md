@@ -549,6 +549,27 @@ Selection happens per run, before built-in detection and forge profiles: the rem
 
 Plugins run through the same environment as built-in provider CLIs (the daemon's login-shell environment plus any forge-profile overlay) with the run worktree as the working directory. A plugin whose `status` exits non-zero (for example, not authenticated) makes the PR and CI steps skip with its message, reported under `run.automatic_skips`; a plugin that breaks the protocol (unreadable output, wrong protocol version, timeout) fails the step instead, in its `status` handshake or in any later call (a timeout during the CI step's repeated polls or log retrieval is handled like any failed read instead). `no-mistakes doctor` lists configured plugins and checks that each command resolves; it does not run the plugin, because the handshake is per repository.
 
+### github_ci_reader
+
+Optional GitHub credential for reading CI check contexts. A fine-grained personal access token has no Checks permission, so on a private repository `gh` cannot read a commit's check runs and the CI step cannot judge readiness. Point this at a command that prints a short-lived read-only token, typically a GitHub App installation token:
+
+```yaml
+github_ci_reader:
+  command: ~/bin/github-app-token
+  args: ["token"]
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `command` | yes | Executable to run. A bare name is resolved from the run's `PATH`; a path must be absolute or begin with `~/`. |
+| `args` | no | Arguments passed before the repository: the command runs as `<command> <args...> <host> <owner>/<repo>`, for example `... github.com acme/app`. |
+
+The command must print one JSON object, the shape of GitHub's [installation access token](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app) response: `token`, `expires_at` (RFC 3339), and `permissions`. The permissions must include `checks: read` and `statuses: read`, and every permission must be `read`. Narrow the token to the one repository when you mint it.
+
+The credential is used for one call only: reading the head commit's check contexts by rollup ID, in the environment of that single `gh` child. The ordinary `gh` login still binds the PR head before and after the read, resolves the rollup, lists Actions workflow runs and jobs, fetches logs, reruns checks, and does every PR and push operation. A new credential is requested for each check discovery and is never stored. If the command fails, prints anything else, or prints an expired, write-capable, or under-scoped credential, the check read fails like any unreadable CI result; it never falls back to the ordinary login. The command's stderr appears in that error, so it must not print secrets there.
+
+`github_ci_reader` is global-only: it is an executable the daemon runs, so a repository `.no-mistakes.yaml` can never set it.
+
 ### ci_timeout
 
 How long the CI step monitors an open PR, including provider CI status and PR mergeability (on GitHub, GitLab, Forgejo, Azure DevOps, or a provider plugin declaring `mergeable_state`), before giving up.

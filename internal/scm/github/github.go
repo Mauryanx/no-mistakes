@@ -29,6 +29,9 @@ type Host struct {
 	repo         string // "owner/name" slug for --repo; empty when unknown
 	forkOwner    string // fork owner for cross-repository PR heads
 	draft        bool   // open created PRs as drafts (gh pr create --draft)
+	// ciReader optionally supplies the check-context read credential
+	// (ci_reader.go); nil keeps every read on the ordinary gh identity.
+	ciReader *CIReader
 	// assetHTTP and assetUploadPrefix override the unofficial user-attachments
 	// upload transport in tests. Production leaves both nil/empty and uses
 	// http.DefaultClient against uploads.github.com (or uploads.<ghec-host>).
@@ -441,7 +444,8 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 		return nil, err
 	}
 	headSHA := ""
-	if strings.TrimSpace(pr.HeadSHA) != "" {
+	// The CI reader cannot read `gh pr checks`, so it always binds the head.
+	if strings.TrimSpace(pr.HeadSHA) != "" || h.ciReader != nil {
 		headSHA, err = h.getPRHeadSHA(ctx, selector)
 		if err != nil {
 			return nil, err
@@ -520,7 +524,9 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 // carries its check suite's app slug: that is the structural identity the CI
 // step uses to tell a third-party review bot's check (scm.ReviewBots) from the
 // repository's own Actions jobs, without matching check names.
-const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{databaseId name status conclusion completedAt startedAt detailsUrl checkSuite{app{slug}}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
+const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{` + checkContextsSelection + `}}}}}`
+
+const checkContextsSelection = `contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{databaseId name status conclusion completedAt startedAt detailsUrl checkSuite{app{slug}}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}`
 
 const reviewThreadsQuery = `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved comments(first:100){nodes{databaseId body path line url createdAt author{login}}}} pageInfo{hasNextPage endCursor}}}}}`
 
@@ -531,18 +537,39 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 		return nil, fmt.Errorf("resolve GitHub repository for commit checks: invalid repository %q", repo)
 	}
 	var checks []scm.Check
+	rollupID, token := "", ""
+	if h.ciReader != nil {
+		var err error
+		rollupID, err = h.headRollupID(ctx, parts[0], parts[1], strings.TrimSpace(headSHA))
+		if err != nil || rollupID == "" {
+			return nil, err
+		}
+		if token, err = h.ciReadToken(ctx); err != nil {
+			return nil, err
+		}
+	}
 	cursor := ""
 	for {
 		args := []string{"api"}
 		if h.host != "" {
 			args = append(args, "--hostname", h.host)
 		}
-		args = append(args, "graphql", "-f", "query="+commitChecksQuery,
-			"-F", "owner="+parts[0], "-F", "name="+parts[1], "-F", "oid="+strings.TrimSpace(headSHA))
+		if token != "" {
+			args = append(args, "graphql", "-f", "query="+rollupChecksQuery, "-F", "id="+rollupID)
+		} else {
+			args = append(args, "graphql", "-f", "query="+commitChecksQuery,
+				"-F", "owner="+parts[0], "-F", "name="+parts[1], "-F", "oid="+strings.TrimSpace(headSHA))
+		}
 		if cursor != "" {
 			args = append(args, "-F", "cursor="+cursor)
 		}
-		out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
+		cmd := h.cmd(ctx, "gh", args...)
+		if token != "" {
+			// Only this child sees the reader credential; gh picks the variable
+			// matching --hostname, so neither can fall back to the stored login.
+			cmd.Env = append(cmd.Environ(), "GH_TOKEN="+token, "GH_ENTERPRISE_TOKEN="+token)
+		}
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("gh api checks for head commit: %s: %w", strings.TrimSpace(string(out)), err)
 		}
@@ -550,47 +577,31 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 			Data struct {
 				Repository *struct {
 					Object *struct {
-						Rollup *struct {
-							Contexts struct {
-								Nodes []struct {
-									Type        string `json:"__typename"`
-									DatabaseID  int64  `json:"databaseId"`
-									ID          string `json:"id"`
-									Name        string `json:"name"`
-									Status      string `json:"status"`
-									Conclusion  string `json:"conclusion"`
-									CompletedAt string `json:"completedAt"`
-									StartedAt   string `json:"startedAt"`
-									DetailsURL  string `json:"detailsUrl"`
-									CheckSuite  *struct {
-										App *struct {
-											Slug string `json:"slug"`
-										} `json:"app"`
-									} `json:"checkSuite"`
-									Context   string `json:"context"`
-									State     string `json:"state"`
-									TargetURL string `json:"targetUrl"`
-								} `json:"nodes"`
-								PageInfo struct {
-									HasNextPage bool   `json:"hasNextPage"`
-									EndCursor   string `json:"endCursor"`
-								} `json:"pageInfo"`
-							} `json:"contexts"`
-						} `json:"statusCheckRollup"`
+						Rollup *checkRollup `json:"statusCheckRollup"`
 					} `json:"object"`
 				} `json:"repository"`
+				Node *checkRollup `json:"node"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(out, &response); err != nil {
 			return nil, fmt.Errorf("parse checks for head commit: %w", err)
 		}
-		if response.Data.Repository == nil || response.Data.Repository.Object == nil {
-			return nil, errors.New("head commit check discovery returned no commit")
+		var rollup *checkRollup
+		if token != "" {
+			// The ID check also proves the node is the requested rollup: a
+			// mismatched type would decode as an empty, falsely green page.
+			if rollup = response.Data.Node; rollup == nil || rollup.ID != rollupID {
+				return nil, errors.New("head commit check discovery returned no rollup")
+			}
+		} else {
+			if response.Data.Repository == nil || response.Data.Repository.Object == nil {
+				return nil, errors.New("head commit check discovery returned no commit")
+			}
+			if rollup = response.Data.Repository.Object.Rollup; rollup == nil {
+				return checks, nil
+			}
 		}
-		if response.Data.Repository.Object.Rollup == nil {
-			return checks, nil
-		}
-		contexts := response.Data.Repository.Object.Rollup.Contexts
+		contexts := rollup.Contexts
 		for _, node := range contexts.Nodes {
 			check := scm.Check{}
 			switch node.Type {
@@ -643,6 +654,37 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 		}
 		cursor = contexts.PageInfo.EndCursor
 	}
+}
+
+// checkRollup is one page of a commit's check rollup, read by commit
+// (commitChecksQuery) or by rollup node ID (rollupChecksQuery).
+type checkRollup struct {
+	ID       string `json:"id"`
+	Contexts struct {
+		Nodes []struct {
+			Type        string `json:"__typename"`
+			DatabaseID  int64  `json:"databaseId"`
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Status      string `json:"status"`
+			Conclusion  string `json:"conclusion"`
+			CompletedAt string `json:"completedAt"`
+			StartedAt   string `json:"startedAt"`
+			DetailsURL  string `json:"detailsUrl"`
+			CheckSuite  *struct {
+				App *struct {
+					Slug string `json:"slug"`
+				} `json:"app"`
+			} `json:"checkSuite"`
+			Context   string `json:"context"`
+			State     string `json:"state"`
+			TargetURL string `json:"targetUrl"`
+		} `json:"nodes"`
+		PageInfo struct {
+			HasNextPage bool   `json:"hasNextPage"`
+			EndCursor   string `json:"endCursor"`
+		} `json:"pageInfo"`
+	} `json:"contexts"`
 }
 
 func (h *Host) repoSlug() string {

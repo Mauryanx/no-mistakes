@@ -28,8 +28,13 @@ func main() {
 	// The fake provider plugin is selected by executable name, not by
 	// FAKE_CLI_MODE: that variable is shared by every fake gh/git in the same
 	// step environment.
-	if isFakeProviderPlugin(os.Args[0]) {
+	if isFakeExecutable(os.Args[0], fakeplugin.ExecutableName) {
 		os.Exit(fakeplugin.Main(os.Args[1:], os.Stdin, os.Stdout, os.Getenv(fakeplugin.EnvState), os.Getenv(fakeplugin.EnvLog)))
+	}
+	// A fake github_ci_reader command prints the configured credential.
+	if isFakeExecutable(os.Args[0], "fake-ci-reader") {
+		fmt.Print(os.Getenv("FAKE_CLI_CI_READER_CREDENTIAL"))
+		os.Exit(0)
 	}
 	mode := os.Getenv("FAKE_CLI_MODE")
 	if mode == "" {
@@ -38,12 +43,12 @@ func main() {
 	handleFakeCLI(mode)
 }
 
-// isFakeProviderPlugin ignores the extension and its case: Windows resolves
+// isFakeExecutable ignores the extension and its case: Windows resolves
 // a PATH lookup through PATHEXT, which yields an upper-case ".EXE".
-func isFakeProviderPlugin(arg0 string) bool {
+func isFakeExecutable(arg0, name string) bool {
 	base := filepath.Base(arg0)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
-	return strings.EqualFold(base, fakeplugin.ExecutableName)
+	return strings.EqualFold(base, name)
 }
 
 func handleFakeCLI(mode string) {
@@ -1003,18 +1008,18 @@ func printFakeCommitChecks(raw string, args []string) {
 		}
 		nodes = append(nodes, node)
 	}
+	// The rollup answers both the by-commit and the CI reader's by-node read.
+	rollup := map[string]any{
+		"id": "ROLLUP_fake",
+		"contexts": map[string]any{
+			"nodes":    nodes,
+			"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+		},
+	}
 	response := map[string]any{
 		"data": map[string]any{
-			"repository": map[string]any{
-				"object": map[string]any{
-					"statusCheckRollup": map[string]any{
-						"contexts": map[string]any{
-							"nodes":    nodes,
-							"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
-						},
-					},
-				},
-			},
+			"repository": map[string]any{"object": map[string]any{"statusCheckRollup": rollup}},
+			"node":       rollup,
 		},
 	}
 	encoded, err := json.Marshal(response)

@@ -1911,6 +1911,10 @@ func TestGitHubHelperProcess(t *testing.T) {
 		return
 	}
 
+	if want, ok := os.LookupEnv("GITHUB_TEST_WANT_GH_TOKEN"); ok && (os.Getenv("GH_TOKEN") != want || os.Getenv("GH_ENTERPRISE_TOKEN") != want) {
+		fmt.Fprintf(os.Stderr, "GH_TOKEN/GH_ENTERPRISE_TOKEN do not match the expected credential %q", want)
+		os.Exit(1)
+	}
 	if want := os.Getenv("GITHUB_TEST_WANT_STDIN"); want != "" {
 		got, err := io.ReadAll(os.Stdin)
 		if err != nil {
